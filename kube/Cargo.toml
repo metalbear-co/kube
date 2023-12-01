@@ -37,9 +37,10 @@ derive = ["kube-derive", "kube-core/schema"]
 runtime = ["kube-runtime"]
 unstable-runtime = ["kube-runtime/unstable-runtime"]
 socks5 = ["kube-client/socks5"]
+http_proxy = ["kube-client/http_proxy"]
 
 [package.metadata.docs.rs]
-features = ["client", "rustls-tls", "openssl-tls", "derive", "ws", "oauth", "jsonpatch", "admission", "runtime", "k8s-openapi/latest", "unstable-runtime", "socks5"]
+features = ["client", "rustls-tls", "openssl-tls", "derive", "ws", "oauth", "jsonpatch", "admission", "runtime", "k8s-openapi/latest", "unstable-runtime", "socks5", "http_proxy"]
 # Define the configuration attribute `docsrs`. Used to enable `doc_cfg` feature.
 rustdoc-args = ["--cfg", "docsrs"]
 
