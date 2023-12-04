@@ -251,11 +251,14 @@ mod test {
         let foos: Api<Foo> = Api::default_namespaced(client.clone());
         // Apply from generated struct
         {
-            let foo = Foo::new("baz", FooSpec {
-                name: "baz".into(),
-                info: Some("old baz".into()),
-                replicas: 1,
-            });
+            let foo = Foo::new(
+                "baz",
+                FooSpec {
+                    name: "baz".into(),
+                    info: Some("old baz".into()),
+                    replicas: 1,
+                },
+            );
             let o = foos.patch("baz", &ssapply, &Patch::Apply(&foo)).await?;
             assert_eq!(o.spec.name, "baz");
             let oref = o.object_ref(&());
