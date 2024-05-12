@@ -25,7 +25,7 @@ where
     /// ListMeta - only really used for its `resourceVersion`
     ///
     /// See [ListMeta](k8s_openapi::apimachinery::pkg::apis::meta::v1::ListMeta)
-    #[serde(deserialize_with = "deserialize_null_as_default")]
+    #[serde(default)]
     pub metadata: ListMeta,
 
     /// The items we are actually interested in. In practice; `T := Resource<T,U>`.
