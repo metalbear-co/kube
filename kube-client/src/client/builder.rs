@@ -116,6 +116,10 @@ impl TryFrom<Config> for ClientBuilder<GenericService> {
     fn try_from(config: Config) -> Result<Self> {
         let mut connector = HttpConnector::new();
         connector.enforce_http(false);
+        // API requests are small and latency sensitive, and long-lived watch and upgraded
+        // connections carry small messages that must go out as soon as they are written.
+        // Nagle's algorithm delays those waiting for more data to coalesce with.
+        connector.set_nodelay(true);
 
         #[cfg(all(feature = "aws-lc-rs", feature = "rustls-tls"))]
         {
