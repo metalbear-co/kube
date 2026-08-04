@@ -116,6 +116,11 @@ impl TryFrom<Config> for ClientBuilder<GenericService> {
     fn try_from(config: Config) -> Result<Self> {
         let mut connector = HttpConnector::new();
         connector.enforce_http(false);
+        // Requests over this connection are small and each one waits for its response, which is
+        // the pattern Nagle's algorithm delays. It is especially costly for long-lived streams
+        // carried over the connection, such as port-forwards, where a request/response protocol
+        // running inside the stream stalls on delayed ACKs.
+        connector.set_nodelay(true);
 
         #[cfg(all(feature = "aws-lc-rs", feature = "rustls-tls"))]
         {
