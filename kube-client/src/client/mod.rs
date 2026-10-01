@@ -258,6 +258,9 @@ impl Client {
         upgrade::StreamProtocol::add_to_headers(&mut parts.headers)?;
 
         let res = self.send(Request::from_parts(parts, Body::from(body))).await?;
+        // 4xx/5xx bodies are `metav1.Status`. Surface them as `Error::Api`
+        // before the upgrade check, which only understands 101.
+        let res = handle_api_errors(res).await?;
         let protocol = upgrade::verify_response(&res, &key).map_err(Error::UpgradeConnection)?;
         match hyper::upgrade::on(res).await {
             Ok(upgraded) => Ok(Connection {
@@ -537,10 +540,9 @@ impl Client {
 /// Kubernetes returned error handling
 ///
 /// Either kube returned an explicit ApiError struct,
-/// or it someohow returned something we couldn't parse as one.
+/// or it somehow returned something we couldn't parse as one.
 ///
 /// In either case, present an ApiError upstream.
-/// The latter is probably a bug if encountered.
 async fn handle_api_errors(res: Response<Body>) -> Result<Response<Body>> {
     let status = res.status();
     if status.is_client_error() || status.is_server_error() {
@@ -549,12 +551,23 @@ async fn handle_api_errors(res: Response<Body>) -> Result<Response<Body>> {
         let text = String::from_utf8(body_bytes.to_vec()).map_err(Error::FromUtf8)?;
         // Print better debug when things do fail
         // trace!("Parsing error: {}", text);
-        if let Ok(status) = serde_json::from_str::<Status>(&text) {
+        // Every field of `Status` has a default, so any JSON object parses as one. A real
+        // `Status` from the apiserver always has a `code`. Other JSON, for example from a
+        // proxy, goes to the fallback below, which keeps the HTTP status and the full body.
+        if let Ok(status) = serde_json::from_str::<Status>(&text)
+            && status.code != 0
+        {
             tracing::debug!("Unsuccessful: {status:?}");
             Err(Error::Api(status.boxed()))
         } else {
-            tracing::warn!("Unsuccessful data error parse: {text}");
-            let status = Status::failure(&text, "Failed to parse error data").with_code(status.as_u16());
+            // Not every error response is a JSON `Status`. A proxy, ingress
+            // controller, or a bare API path that doesn't exist (e.g. a CRD
+            // that isn't installed yet) can return a plain-text or HTML body
+            // instead. This is routine rather than exceptional, so it's
+            // logged at `debug` like the parsed case above rather than `warn`.
+            let text = text.trim();
+            tracing::debug!("Unsuccessful data error parse: {text}");
+            let status = Status::failure(text, "Failed to parse error data").with_code(status.as_u16());
             tracing::debug!("Unsuccessful: {status:?} (reconstruct)");
             Err(Error::Api(status.boxed()))
         }
@@ -809,6 +822,104 @@ mod tests {
             panic!("watch with an error response should fail");
         };
         assert!(matches!(&err, Error::Api(s) if s.code == 403), "got {err:?}");
+        spawned.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_non_json_error_response_is_reconstructed() {
+        let (mock_service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+        let spawned = tokio::spawn(async move {
+            let mut handle = pin!(handle);
+            let (_request, send) = handle.next_request().await.expect("service not called");
+            // Some routers in front of the apiserver (or a probe for a CRD
+            // that isn't installed yet) return a plain-text 404 instead of a
+            // JSON `Status`.
+            send.send_response(
+                Response::builder()
+                    .status(http::StatusCode::NOT_FOUND)
+                    .body(Body::from(b"404 page not found\n".to_vec()))
+                    .unwrap(),
+            );
+        });
+
+        let pods: Api<Pod> = Api::default_namespaced(Client::new(mock_service, "default"));
+        let Err(err) = pods.get("test").await else {
+            panic!("get with a non-JSON error response should fail");
+        };
+        let Error::Api(status) = &err else {
+            panic!("expected Error::Api, got {err:?}");
+        };
+        assert_eq!(status.code, 404);
+        assert_eq!(status.reason, "Failed to parse error data");
+        assert_eq!(status.message, "404 page not found");
+        spawned.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_json_error_response_without_code_is_reconstructed() {
+        let (mock_service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+        let spawned = tokio::spawn(async move {
+            let mut handle = pin!(handle);
+            let (_request, send) = handle.next_request().await.expect("service not called");
+            // A proxy in front of the apiserver can return JSON that is not a `Status`.
+            send.send_response(
+                Response::builder()
+                    .status(http::StatusCode::BAD_GATEWAY)
+                    .body(Body::from(br#"{"error":"no healthy upstream"}"#.to_vec()))
+                    .unwrap(),
+            );
+        });
+
+        let pods: Api<Pod> = Api::default_namespaced(Client::new(mock_service, "default"));
+        let Err(err) = pods.get("test").await else {
+            panic!("get with an error response should fail");
+        };
+        let Error::Api(status) = &err else {
+            panic!("expected Error::Api, got {err:?}");
+        };
+        assert_eq!(status.code, 502);
+        assert_eq!(status.reason, "Failed to parse error data");
+        assert_eq!(status.message, r#"{"error":"no healthy upstream"}"#);
+        spawned.await.unwrap();
+    }
+
+    #[cfg(feature = "ws")]
+    #[tokio::test]
+    async fn connect_returns_api_error_for_forbidden_status() {
+        let (mock_service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+        let spawned = tokio::spawn(async move {
+            let mut handle = pin!(handle);
+            let (_request, send) = handle.next_request().await.expect("service not called");
+            let body = serde_json::json!({
+                "status": "Failure",
+                "message": "pods \"my-pod\" is forbidden: User \"system:serviceaccount:default:my-sa\" cannot create resource \"pods/exec\"",
+                "reason": "Forbidden",
+                "code": 403
+            });
+            send.send_response(
+                Response::builder()
+                    .status(403)
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            );
+        });
+
+        let client = Client::new(mock_service, "default");
+        let request = Request::builder()
+            .uri("/api/v1/namespaces/default/pods/my-pod/exec")
+            .body(Vec::new())
+            .unwrap();
+        let err = match client.connect(request).await {
+            Err(err) => err,
+            Ok(_) => panic!("403 is an API error"),
+        };
+        match err {
+            Error::Api(status) => {
+                assert_eq!(status.code, 403);
+                assert!(status.message.contains("forbidden"), "{}", status.message);
+            }
+            other => panic!("expected Api error, got {other}"),
+        }
         spawned.await.unwrap();
     }
 }
