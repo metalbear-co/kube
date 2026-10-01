@@ -551,7 +551,12 @@ async fn handle_api_errors(res: Response<Body>) -> Result<Response<Body>> {
         let text = String::from_utf8(body_bytes.to_vec()).map_err(Error::FromUtf8)?;
         // Print better debug when things do fail
         // trace!("Parsing error: {}", text);
-        if let Ok(status) = serde_json::from_str::<Status>(&text) {
+        // Every field of `Status` has a default, so any JSON object parses as one. A real
+        // `Status` from the apiserver always has a `code`. Other JSON, for example from a
+        // proxy, goes to the fallback below, which keeps the HTTP status and the full body.
+        if let Ok(status) = serde_json::from_str::<Status>(&text)
+            && status.code != 0
+        {
             tracing::debug!("Unsuccessful: {status:?}");
             Err(Error::Api(status.boxed()))
         } else {
@@ -847,6 +852,34 @@ mod tests {
         assert_eq!(status.code, 404);
         assert_eq!(status.reason, "Failed to parse error data");
         assert_eq!(status.message, "404 page not found");
+        spawned.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_json_error_response_without_code_is_reconstructed() {
+        let (mock_service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+        let spawned = tokio::spawn(async move {
+            let mut handle = pin!(handle);
+            let (_request, send) = handle.next_request().await.expect("service not called");
+            // A proxy in front of the apiserver can return JSON that is not a `Status`.
+            send.send_response(
+                Response::builder()
+                    .status(http::StatusCode::BAD_GATEWAY)
+                    .body(Body::from(br#"{"error":"no healthy upstream"}"#.to_vec()))
+                    .unwrap(),
+            );
+        });
+
+        let pods: Api<Pod> = Api::default_namespaced(Client::new(mock_service, "default"));
+        let Err(err) = pods.get("test").await else {
+            panic!("get with an error response should fail");
+        };
+        let Error::Api(status) = &err else {
+            panic!("expected Error::Api, got {err:?}");
+        };
+        assert_eq!(status.code, 502);
+        assert_eq!(status.reason, "Failed to parse error data");
+        assert_eq!(status.message, r#"{"error":"no healthy upstream"}"#);
         spawned.await.unwrap();
     }
 
